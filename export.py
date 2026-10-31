@@ -39,8 +39,15 @@ def _add_inline(paragraph, text: str) -> None:
                 run.bold = True
 
 
+def _cell_text(cell: str) -> str:
+    cell = re.sub(r"<br\s*/?>", "\n", cell.strip())     # line breaks inside a cell
+    if cell.count("**") % 2:                            # "**预算科目" from a bolded row
+        cell = cell.replace("**", "")
+    return cell
+
+
 def _add_table(document, rows: list[str]) -> None:
-    cells = [[c.strip() for c in row.strip().strip("|").split("|")] for row in rows]
+    cells = [[_cell_text(c) for c in row.strip().strip("|").split("|")] for row in rows]
     cells = [r for r in cells if not all(re.fullmatch(r":?-{2,}:?", c) for c in r)]
     if not cells:
         return
@@ -68,9 +75,9 @@ def _add_body(document, text: str) -> None:
         if not stripped:
             i += 1
             continue
-        if stripped.startswith("|"):
+        if stripped.count("|") >= 2:                    # table row, pipes optional at the ends
             block = []
-            while i < len(lines) and lines[i].strip().startswith("|"):
+            while i < len(lines) and lines[i].count("|") >= 2:
                 block.append(lines[i])
                 i += 1
             _add_table(document, block)

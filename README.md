@@ -40,7 +40,7 @@ Sections: 立项依据 · 研究目标 · 研究内容 · 研究方案与技术�
 | File | Responsibility |
 |---|---|
 | `prompts.py` | `SECTIONS` (title + default prompt per section), `SECTION_ORDER`, shared `SYSTEM_PROMPT` with the guard rules, the guideline-analysis prompt and an example idea |
-| `agent.py` | `load_guideline`, `analyse_guideline` (JSON-schema structured output, chunked for long guidelines), `build_context` (fits context into the token budget), `generate_section` (streaming), `generate_all` |
+| `agent.py` | LangChain layer: `get_llm` (`ChatGroq`), `load_guideline`, `analyse_guideline` (`ChatPromptTemplate` + `with_structured_output`, chunked for long guidelines), `build_context` (fits context into the token budget), `generate_section` (a streamed `prompt \| llm` chain), `fix_budget` / `check_budget` / `write_budget` (budget arithmetic in code), `generate_all` |
 | `app.py` | Streamlit UI. All state is kept in `st.session_state` |
 | `export.py` | `to_docx(title, sections) → bytes` |
 
@@ -76,18 +76,20 @@ The app opens at http://localhost:8501.
 
 ## Design choices
 
-- **Structured extraction first.** The guideline is reduced once to a schema-validated summary: a Pydantic model is sent as a strict JSON schema (`response_format={"type": "json_schema", ...}`) and the reply is validated against it. Every section then works from the same facts instead of re-reading a 30-page PDF. The summary can be edited, which lets a human fix a misread budget cap before it spreads into every section.
+- **Built on LangChain.** `ChatGroq` is the model, `ChatPromptTemplate` builds the messages, and each section is a `prompt | llm` chain streamed into the UI. Switching to another provider (OpenAI, Claude, a local model) means changing only `get_llm`.
+- **Structured extraction first.** The guideline is reduced once to a schema-validated summary: `llm.with_structured_output(GuidelineSummary, method="json_schema")` makes the model return exactly the fields of a Pydantic model. Every section then works from the same facts instead of re-reading a 30-page PDF. The summary can be edited, which lets a human fix a misread budget cap before it spreads into every section.
 - **Built for a free API.** Groq's free tier allows 8,000 tokens per minute, and a single request can't be larger than that. So long guidelines are read in chunks and the partial summaries are merged in code; earlier sections are clipped to share whatever room is left in the context; and the client automatically waits and retries when the per-minute limit is hit. With a paid plan, set `GROQ_TOKEN_LIMIT` higher and everything scales up.
 - **Sequential generation with accumulated context.** Writing in NSFC order and passing all earlier sections forward keeps terminology, objectives and the technical route consistent. The timeline and budget are written last, so they can match the research content.
 - **Guard rules in the system prompt** (applied to every section) and repeated in the relevant section prompts:
   - no invented citations or statistics: the model writes `[待补充文献]` / `[待补充数据]` placeholders instead;
-  - the budget total stays within the guideline's cap and must add up;
+  - the budget total stays within the guideline's cap;
   - the timeline matches the project duration exactly;
   - every section must address the guideline's priority areas.
 - **Literal placeholder filling** (not `str.format`). A user can type `{` or `}` in an edited prompt without crashing the app.
 - **Reasoning kept short.** GPT-OSS runs at low reasoning effort (and Qwen's thinking mode is off if you add it back), so the limited token budget goes to the proposal text rather than hidden reasoning.
 - **No invented names.** Besides citations and statistics, the rules forbid naming any dataset, benchmark, metric or model the model isn't certain exists. It must write `[待补充数据集]` or a generic description instead.
 - **Streaming output**, so long sections appear as they are written.
+- **The LLM proposes, the code calculates.** Language models are unreliable at arithmetic: in testing, the budget's subtotals were wrong even after the errors were pointed out. So the model only chooses the budget items, quantities and unit prices. `fix_budget` recalculates every subtotal, category amount and the total in Python and rewrites the table, and `check_budget` flags what code can't fix (a total over the cap, indirect costs listed). The budget is regenerated with that feedback, up to two retries. The UI shows the check result under the budget and has a **自动修正计算** button for hand-edited budgets.
 
 ## Limitations
 

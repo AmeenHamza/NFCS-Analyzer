@@ -56,6 +56,10 @@ def reset_prompt(key: str) -> None:
     ss[f"prompt_{key}"] = SECTIONS[key]["prompt"]
 
 
+def fix_budget_output() -> None:
+    ss["out_budget"], _ = agent.fix_budget(ss["out_budget"])
+
+
 def load_example() -> None:
     ss.idea_title = EXAMPLE_IDEA_TITLE
     ss.idea_text = EXAMPLE_IDEA_TEXT
@@ -192,15 +196,32 @@ for key in SECTION_ORDER:
                                           ss[f"prompt_{key}"])
             live = st.empty()
             try:
-                ss[f"out_{key}"] = agent.generate_section(
-                    key, ss[f"prompt_{key}"], context, model=model, temperature=temperature,
-                    on_text=lambda t: live.markdown(t + " ▌"))
+                show = lambda t: live.markdown(t + " ▌")
+                if key == "budget":   # code fixes the arithmetic, then retries if over the cap
+                    ss[f"out_{key}"] = agent.write_budget(
+                        ss[f"prompt_{key}"], context, current_summary(), model, temperature,
+                        on_text=show)
+                else:
+                    ss[f"out_{key}"] = agent.generate_section(
+                        key, ss[f"prompt_{key}"], context, model=model,
+                        temperature=temperature, on_text=show)
                 live.empty()
             except groq.APIError as err:
                 live.empty()
                 show_api_error(err)
 
         st.text_area("生成结果（可直接编辑）Output", key=f"out_{key}", height=360)
+
+        if key == "budget" and ss[f"out_{key}"].strip():
+            fixed, notes = agent.fix_budget(ss[f"out_{key}"])
+            issues = agent.check_budget(fixed, ss.get("sum_budget_cap", ""))
+            if notes:
+                st.warning("预算计算有误 Arithmetic errors:\n\n- " + "\n- ".join(notes))
+                st.button("🧮 自动修正计算 Fix arithmetic", on_click=fix_budget_output)
+            if issues:
+                st.warning("预算核算发现问题 Budget check:\n\n- " + "\n- ".join(issues))
+            if not notes and not issues:
+                st.success("预算核算通过：各项计算正确，合计未超过上限。")
 
 # ------------------------------------------------------------------ step 4
 

@@ -1,14 +1,22 @@
-"""LLM logic: read a guideline, summarise it, and generate proposal sections (Groq)."""
+"""LLM logic built on LangChain (Groq models).
+
+- ChatGroq is the model; ChatPromptTemplate builds the messages.
+- The guideline summary uses with_structured_output (a Pydantic schema).
+- Each section is a prompt | model chain, streamed into the UI.
+- The budget's arithmetic is recalculated in plain Python, not by the model.
+"""
 
 import io
-import json
 import os
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
 
 import docx
-import groq
 from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
 from pydantic import BaseModel, ConfigDict, Field
 from pypdf import PdfReader
 
@@ -32,19 +40,6 @@ SAFETY_TOKENS = 400
 SECTION_MAX_TOKENS = 3500       # output budget for one section
 ANALYSE_MAX_TOKENS = 2000       # output budget for one guideline chunk
 
-_client: Optional[groq.Groq] = None
-
-
-def get_client() -> groq.Groq:
-    """Create the client lazily so the UI can start before a key is set.
-
-    max_retries lets the SDK wait out per-minute rate limits (it honours retry-after).
-    """
-    global _client
-    if _client is None:
-        _client = groq.Groq(max_retries=8)  # reads GROQ_API_KEY from env / .env
-    return _client
-
 
 def has_api_key() -> bool:
     return bool(os.getenv("GROQ_API_KEY"))
@@ -57,6 +52,13 @@ def _model_options(model: str) -> dict:
     if model.startswith("openai/gpt-oss"):
         return {"reasoning_effort": "low"}
     return {}
+
+
+@lru_cache(maxsize=16)
+def get_llm(model: str, temperature: float, max_tokens: int) -> ChatGroq:
+    """One ChatGroq per setting. max_retries waits out per-minute rate limits."""
+    return ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens,
+                    max_retries=8, **_model_options(model))  # reads GROQ_API_KEY
 
 
 def _chars_for(tokens: int) -> int:
@@ -132,6 +134,9 @@ SUMMARY_LABELS = {
 
 MISSING = {"", "未说明", "not specified", "n/a", "none"}
 
+# {language} and {guideline_text} are LangChain template variables.
+ANALYSE_TEMPLATE = ChatPromptTemplate.from_messages([("human", ANALYSE_PROMPT)])
+
 
 def split_text(text: str, size: int) -> list[str]:
     """Split on paragraph boundaries into pieces of at most `size` characters."""
@@ -170,39 +175,22 @@ def merge_summaries(parts: list[dict]) -> dict:
     return merged
 
 
-def _analyse_chunk(chunk: str, model: str, language: str) -> dict:
-    response = get_client().chat.completions.create(
-        model=model,
-        max_tokens=ANALYSE_MAX_TOKENS,
-        temperature=0.1,
-        messages=[{
-            "role": "user",
-            "content": ANALYSE_PROMPT.replace("{language}", language)
-                                     .replace("{guideline_text}", chunk),
-        }],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "guideline_summary", "strict": True,
-                            "schema": GuidelineSummary.model_json_schema()},
-        },
-        **_model_options(model),
-    )
-    content = response.choices[0].message.content or "{}"
-    return GuidelineSummary.model_validate(json.loads(content)).model_dump()
-
-
 def analyse_guideline(text: str, model: str = DEFAULT_MODEL, language: str = "中文",
                       on_progress: Optional[Callable[[int, int], None]] = None) -> dict:
     """Extract a structured summary. Long guidelines are read chunk by chunk
     (to stay under the per-request token limit) and the results are merged."""
+    llm = get_llm(model, 0.1, ANALYSE_MAX_TOKENS)
+    chain = ANALYSE_TEMPLATE | llm.with_structured_output(
+        GuidelineSummary, method="json_schema", strict=True)
+
     room = TOKEN_LIMIT - ANALYSE_MAX_TOKENS - SAFETY_TOKENS
-    chunk_chars = _chars_for(room) - len(ANALYSE_PROMPT)
-    chunks = split_text(text, chunk_chars)
+    chunks = split_text(text, _chars_for(room) - len(ANALYSE_PROMPT))
     parts = []
     for i, chunk in enumerate(chunks, start=1):
         if on_progress:
             on_progress(i, len(chunks))
-        parts.append(_analyse_chunk(chunk, model, language))
+        result = chain.invoke({"language": language, "guideline_text": chunk})
+        parts.append(result.model_dump())
     return parts[0] if len(parts) == 1 else merge_summaries(parts)
 
 
@@ -218,6 +206,14 @@ def format_summary(summary: dict) -> str:
 
 
 # ---------------------------------------------------------------- sections
+
+# The section prompt is passed in as a value, not parsed as a template, so a
+# user can type { or } in an edited prompt without breaking it.
+SECTION_TEMPLATE = ChatPromptTemplate.from_messages([
+    ("system", "{system}"),
+    ("human", "{prompt}"),
+])
+
 
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "……（后略）"
@@ -264,30 +260,159 @@ def generate_section(key: str, prompt: str, context: dict, model: str = DEFAULT_
                      temperature: float = 0.7,
                      on_text: Optional[Callable[[str], None]] = None) -> str:
     """Generate one section. `on_text` receives the growing text while streaming."""
-    stream = get_client().chat.completions.create(
-        model=model,
-        max_tokens=SECTION_MAX_TOKENS,
-        temperature=temperature,
-        stream=True,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": fill_prompt(prompt, context)},
-        ],
-        **_model_options(model),
-    )
+    chain = SECTION_TEMPLATE | get_llm(model, temperature, SECTION_MAX_TOKENS)
     text, finish = "", None
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-        choice = chunk.choices[0]
-        if choice.delta.content:
-            text += choice.delta.content
+    for chunk in chain.stream({"system": SYSTEM_PROMPT,
+                               "prompt": fill_prompt(prompt, context)}):
+        if chunk.content:
+            text += chunk.content
             if on_text:
                 on_text(text)
-        finish = choice.finish_reason or finish
+        finish = chunk.response_metadata.get("finish_reason") or finish
     if finish == "length":
         text += "\n\n[输出达到长度上限，请重新生成或精简提示词]"
     return text.strip()
+
+
+# ---------------------------------------------------------------- budget check
+
+_NUMBER = r"(\d+(?:\.\d+)?)"
+
+
+def _amount(cell: str) -> Optional[float]:
+    match = re.search(_NUMBER, cell.replace(",", ""))
+    return float(match.group(1)) if match else None
+
+
+def _last_number(text: str) -> Optional[float]:
+    numbers = re.findall(_NUMBER, text)
+    return float(numbers[-1]) if numbers else None
+
+
+def _fmt(value: float) -> str:
+    return f"{round(value, 4):g}"
+
+
+def is_table_row(line: str) -> bool:
+    """Markdown table rows, with or without the leading and trailing pipes."""
+    return line.count("|") >= 2
+
+
+def _parse_item(item: str):
+    """'名称：2 人 × 12 个月 × 0.30 万元 = 7.2 万元）' ->
+    (label, factors, written subtotal, text after the subtotal such as '）')."""
+    item = re.sub(r"(?<=\d),(?=\d{3})", "", item.strip())   # 30,000 -> 30000
+    if "=" not in item:
+        return item, [], None, ""
+    left, right = item.rsplit("=", 1)
+    factors = [_last_number(f) for f in re.split(r"[×*]", left)]
+    factors = factors if len(factors) >= 2 and None not in factors else []
+    tail = re.sub(r"^\s*\d+(?:\.\d+)?\s*(万元)?", "", right)
+    return left.strip(), factors, _amount(right), tail.strip()
+
+
+def _parse_budget(text: str):
+    """Find the budget table. Returns (categories, total, first_line, last_line) or None."""
+    lines = text.splitlines()
+    idx = [i for i, line in enumerate(lines) if is_table_row(line)]
+    if len(idx) < 2:
+        return None
+    categories, total = [], None
+    for i in idx:
+        cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+        if len(cells) < 2 or re.fullmatch(r"[:\- ]+", cells[0] + cells[1]):
+            continue
+        name, amount = cells[0].strip("* "), _amount(cells[1])
+        if amount is None:                     # header row
+            continue
+        if "合计" in name or "总计" in name:
+            total = amount
+            continue
+        basis = cells[2] if len(cells) > 2 else ""
+        items = [_parse_item(p) for p in re.split(r"<br\s*/?>|；", basis) if p.strip()]
+        categories.append({"name": name, "amount": amount, "items": items})
+    return categories, total, idx[0], idx[-1]
+
+
+def fix_budget(text: str) -> tuple[str, list[str]]:
+    """Recalculate the budget in code: subtotal = product of factors, category =
+    sum of subtotals, total = sum of categories. Returns (new text, corrections)."""
+    parsed = _parse_budget(text)
+    if not parsed:
+        return text, []
+    categories, total, first, last = parsed
+    notes, rows = [], []
+    for cat in categories:
+        parts, subtotal_sum, has_subtotals = [], 0.0, False
+        for label, factors, written, tail in cat["items"]:
+            if factors:
+                value = 1.0
+                for f in factors:
+                    value *= f
+                if written is not None and abs(value - written) > 0.005:
+                    item_name = re.split(r"[：:（(]", label)[0][:20]
+                    notes.append(f"{cat['name']}·{item_name} 小计 {_fmt(written)} → {_fmt(value)} 万元")
+            else:
+                value = written
+            if value is None:
+                parts.append(label)
+                continue
+            has_subtotals = True
+            subtotal_sum += value
+            parts.append(f"{label} = {_fmt(value)}万元{tail}")
+        amount = subtotal_sum if has_subtotals else cat["amount"]
+        if abs(amount - cat["amount"]) > 0.005:
+            notes.append(f"{cat['name']} {_fmt(cat['amount'])} → {_fmt(amount)} 万元")
+        cat["amount"] = amount
+        rows.append(f"| {cat['name']} | {_fmt(amount)} | {'<br>'.join(parts)} |")
+    new_total = sum(c["amount"] for c in categories)
+    if total is None or abs(new_total - total) > 0.005:
+        notes.append(f"合计 {_fmt(total) if total is not None else '（缺失）'} → {_fmt(new_total)} 万元")
+    table = ["| 预算科目 | 金额（万元） | 测算依据 |", "|---|---|---|", *rows,
+             f"| **合计** | **{_fmt(new_total)}** | |"]
+    lines = text.splitlines()
+    return "\n".join(lines[:first] + table + lines[last + 1:]), notes
+
+
+def check_budget(text: str, budget_cap: str = "") -> list[str]:
+    """Problems code cannot fix by itself: missing table, wrong categories, over the cap.
+    Run fix_budget first so the arithmetic is already correct."""
+    parsed = _parse_budget(text)
+    if not parsed:
+        return ["未找到预算表格（应为 预算科目 | 金额（万元） | 测算依据 的 Markdown 表格）。"]
+    categories, total, _, _ = parsed
+    issues = [f"“{c['name']}”不应列入申请预算（间接费用由基金委核定）。"
+              for c in categories if "间接" in c["name"]]
+    category_sum = sum(c["amount"] for c in categories)
+    if total is None or abs(category_sum - total) > 0.005:
+        issues.append(f"各科目之和为 {_fmt(category_sum)} 万元，与合计不一致（可点击“自动修正计算”）。")
+    caps = [float(n) for n in re.findall(_NUMBER + r"\s*万元", budget_cap)]
+    if caps and category_sum > max(caps) + 0.005:
+        issues.append(f"预算合计 {_fmt(category_sum)} 万元超过指南上限 {_fmt(max(caps))} 万元，"
+                      f"请削减 {_fmt(category_sum - max(caps))} 万元。")
+    return issues
+
+
+# ---------------------------------------------------------------- full proposal
+
+MAX_BUDGET_RETRIES = 2
+
+
+def write_budget(prompt: str, context: dict, summary: dict, model: str, temperature: float,
+                 on_text: Optional[Callable[[str], None]] = None) -> str:
+    """Generate the budget, let code fix the arithmetic, and retry (up to twice)
+    with the remaining problems, e.g. a total above the guideline's cap."""
+    text = ""
+    for _ in range(1 + MAX_BUDGET_RETRIES):
+        text = generate_section("budget", prompt, context, model=model,
+                                temperature=temperature, on_text=on_text)
+        text, _ = fix_budget(text)
+        issues = check_budget(text, summary.get("budget_cap", ""))
+        if not issues:
+            break
+        prompt += ("\n\n【上一版预算未通过核算，请修正以下问题后重写完整预算】\n- " +
+                   "\n- ".join(issues))
+    return text
 
 
 def generate_all(summary: dict, idea_title: str, idea_text: str, prompts: dict,
@@ -299,8 +424,11 @@ def generate_all(summary: dict, idea_title: str, idea_text: str, prompts: dict,
     for key in SECTION_ORDER:
         prompt = prompts.get(key, SECTIONS[key]["prompt"])
         context = build_context(summary, idea_title, idea_text, language, sections, key, prompt)
-        sections[key] = generate_section(key, prompt, context, model=model,
-                                         temperature=temperature)
+        if key == "budget":
+            sections[key] = write_budget(prompt, context, summary, model, temperature)
+        else:
+            sections[key] = generate_section(key, prompt, context, model=model,
+                                             temperature=temperature)
         if on_section:
             on_section(key, sections[key])
     return sections
